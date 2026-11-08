@@ -27,3 +27,62 @@ com.example.nsfwfilter/
 ├── NSFWClassifier.kt     # Moteur TensorFlow Lite (MobileNetV2) : pré-traitements Keras,
 │                         # calcul de skinRatio et évaluation des scores NSFW.
 └── MainActivity.kt       # Interface d'activation du service et des autorisations.
+
+---
+
+## **🛠️ Spécifications Techniques**
+
+ComposantTechnologie / Modèle
+LangageKotlinAPI MinimaleAndroid 11 (API level 30)Modèle IAMobileNetV2 NSFW Quantized (nsfw_model.tflite)PrétraitementNormalisation Keras [-1.0, 1.0], Resize Bilinéaire 224x224ConcurrenceCoroutines Kotlin (SupervisorJob, Dispatchers.Default), AtomicLong
+
+---
+
+## **⚙️ Configuration & Ajustement de la Sensibilité**
+
+Les seuils de sensibilité peuvent être ajustés directement dans NSFWClassifier.kt :Kotlin// Dans NSFWClassifier.kt
+private const val CROP_THRESHOLD = 0.35f               // Seuil pour les nœuds d'images ciblés
+private const val GLOBAL_THRESHOLD = 0.35f             // Seuil pour l'écran complet
+private const val STRICT_NO_SKIN_THRESHOLD = 0.55f     // Seuil renforcé sans teinte chair (banques)
+Et la fréquence d'analyse dans FilterService.kt :Kotlin// Dans FilterService.kt
+private const val NORMAL_CAPTURE_INTERVAL_MS = 350L     // Intervalle pendant le défilement
+private const val STATIC_RECHECK_INTERVAL_MS = 1200L   // Intervalle de ré-analyse sur écran fixe
+
+---
+
+## **🚀 Installation & Compilation**
+
+### Prérequis
+* Android Studio Ladybug (ou version ultérieure)
+* JDK 17
+* SDK Android 34 (Android 14) ou supérieur
+### Étapes de Build
+1. Cloner le dépôt :
+```git clone [https://github.com/votre-utilisateur/NSFWFilter.git](https://github.com/votre-utilisateur/NSFWFilter.git)```
+2. Ouvrir le projet dans Android Studio.
+3. Synchroniser Gradle (Sync Project with Gradle Files).
+4. Compiler et installer sur un appareil Android sous Android 11 ou supérieur :
+```./gradlew installDebug```
+
+---
+
+## **🤝 Contribution**
+
+Les contributions sont les bienvenues ! Voici comment participer :
+1. Remonter un bug ou proposer une fonctionnalité via les Issues GitHub.
+2. Forquer le projet (Fork).
+3. Créer une branche dédiée (git checkout -b feature/AmeliorationFiltre).
+4. Commiter tes modifications (git commit -m 'Ajout de la fonction X').
+5. Pousser la branche (git push origin feature/AmeliorationFiltre).
+6. Ouvrir une Pull Request.
+
+---
+
+## **📄 Licence**
+
+Ce projet est sous licence MIT - voir le fichier LICENSE pour plus de détails.
+
+---
+
+## **⚠️ Avertissement (Disclaimer)**
+
+Cet outil est fourni à titre d'aide personnelle et éducative. Bien que conçu pour maximiser la précision, le filtrage basé sur l'IA peut présenter des faux positifs ou faux négatifs en fonction du contexte visuel et des applications utilisées.
