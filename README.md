@@ -27,6 +27,7 @@ com.example.nsfwfilter/
 ├── NSFWClassifier.kt     # Moteur TensorFlow Lite (MobileNetV2) : pré-traitements Keras,
 │                         # calcul de skinRatio et évaluation des scores NSFW.
 └── MainActivity.kt       # Interface d'activation du service et des autorisations.
+```
 
 ---
 
