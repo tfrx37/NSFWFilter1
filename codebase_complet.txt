@@ -1,0 +1,1089 @@
+﻿==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\java\com\example\nsfwfilter\FilterService.kt
+==========================================
+package com.example.nsfwfilter
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityService.TakeScreenshotCallback
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.pm.ServiceInfo
+import android.graphics.*
+import android.graphics.drawable.BitmapDrawable
+import android.os.Build
+import android.util.Log
+import android.view.Display
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.ImageView
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class FilterService : AccessibilityService() {
+
+    private lateinit var classifier: NSFWClassifier
+    private var windowManager: WindowManager? = null
+    private var overlayView: ImageView? = null
+    private var isOverlayAttached = false
+
+    private val screenshotExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    private var isAnalyzing = false
+    private var isOverlayShowing = false
+    private var lastCaptureTime = 0L
+    private var lastNsfwDetectedTime = 0L
+
+    private var lastImageNodesHash = 0
+    private var consecutiveFailures = 0
+    private var isCircuitBreakerActive = false
+
+    // Watchdog pour Ã©viter le blocage infini de isAnalyzing
+    private var watchdogJob: Job? = null
+
+    private val HOLD_MASK_MS = 1800L
+    private val NOTIFICATION_ID = 1001
+    private val CHANNEL_ID = "nsfw_filter_foreground_channel"
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        startForegroundNotification()
+        classifier = NSFWClassifier(this)
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        setupOverlayView()
+        Log.d("FilterService", "=== Service d'accessibilitÃ© connectÃ© et prÃªt ! ===")
+    }
+
+    private fun startForegroundNotification() {
+        val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Protection Active NSFWFilter",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Maintient l'analyse active en arriÃ¨re-plan"
+                setShowBadge(false)
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("NSFWFilter est actif")
+            .setContentText("Protection de l'Ã©cran en cours")
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun setupOverlayView() {
+        if (isOverlayAttached) return
+
+        overlayView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_XY
+            alpha = 0f
+            visibility = View.VISIBLE
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+        }
+
+        try {
+            windowManager?.addView(overlayView, params)
+            isOverlayAttached = true
+        } catch (e: Exception) {
+            Log.e("FilterService", "Erreur attachement overlay : ${e.message}")
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (checkAndBlockSettingsAccess(event)) {
+            return
+        }
+
+        val currentTime = System.currentTimeMillis()
+
+        if (isOverlayShowing && (currentTime - lastNsfwDetectedTime < HOLD_MASK_MS)) {
+            return
+        }
+
+        if (isCircuitBreakerActive || isAnalyzing) return
+
+        val minInterval = if (isOverlayShowing) 500L else 350L
+        if (currentTime - lastCaptureTime < minInterval) return
+
+        val currentBounds = getVisibleImageBounds()
+        val currentHash = currentBounds.hashCode()
+
+        if (!isOverlayShowing && currentHash == lastImageNodesHash && currentBounds.isNotEmpty()) {
+            return
+        }
+
+        lastImageNodesHash = currentHash
+        lastCaptureTime = currentTime
+        captureAndAnalyzeScreen(currentBounds)
+    }
+
+    private fun checkAndBlockSettingsAccess(event: AccessibilityEvent?): Boolean {
+        val packageName = event?.packageName?.toString() ?: return false
+
+        if (packageName == "com.android.settings" || packageName.contains("setting", ignoreCase = true)) {
+            val rootNode = rootInActiveWindow ?: return false
+
+            try {
+                val hasAppName = isNodeTreeContainsText(rootNode, listOf("NSFWFilter", "nsfwfilter"))
+
+                if (hasAppName) {
+                    val isAppInfoPage = isNodeTreeContainsText(
+                        rootNode,
+                        listOf("DÃ©sinstaller", "Uninstall", "Forcer l'arrÃªt", "Force stop")
+                    )
+
+                    val isAccessibilityTogglePage = isNodeTreeContainsText(
+                        rootNode,
+                        listOf(
+                            "Utiliser NSFWFilter", "Use NSFWFilter",
+                            "Raccourci NSFWFilter", "NSFWFilter shortcut",
+                            "Autoriser NSFWFilter", "Allow NSFWFilter"
+                        )
+                    ) || hasSwitchOrToggle(rootNode)
+
+                    if (isAppInfoPage || isAccessibilityTogglePage) {
+                        Log.w("FilterService", "--> TENTATIVE DE DÃ‰SACTIVATION DE NSFWFILTER : RETOUR ACCUEIL")
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                        return true
+                    }
+                }
+            } finally {
+                rootNode.recycle()
+            }
+        }
+        return false
+    }
+
+    private fun hasSwitchOrToggle(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+
+        val className = node.className?.toString() ?: ""
+        if (className.contains("Switch", ignoreCase = true) ||
+            className.contains("ToggleButton", ignoreCase = true) ||
+            className.contains("CheckBox", ignoreCase = true)) {
+            return true
+        }
+
+        val text = node.text?.toString() ?: ""
+        if (text.contains("Utiliser", ignoreCase = true) ||
+            text.contains("Raccourci", ignoreCase = true) ||
+            text.contains("Shortcut", ignoreCase = true)) {
+            return true
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i)
+            if (hasSwitchOrToggle(child)) {
+                child?.recycle()
+                return true
+            }
+            child?.recycle()
+        }
+        return false
+    }
+
+    private fun isNodeTreeContainsText(node: AccessibilityNodeInfo?, keywords: List<String>): Boolean {
+        if (node == null) return false
+
+        val text = node.text?.toString() ?: ""
+        val contentDesc = node.contentDescription?.toString() ?: ""
+
+        for (keyword in keywords) {
+            if (text.contains(keyword, ignoreCase = true) || contentDesc.contains(keyword, ignoreCase = true)) {
+                return true
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i)
+            if (isNodeTreeContainsText(child, keywords)) {
+                child?.recycle()
+                return true
+            }
+            child?.recycle()
+        }
+        return false
+    }
+
+    private fun captureAndAnalyzeScreen(imageBounds: List<Rect>) {
+        isAnalyzing = true
+
+        // SECURITÃ‰ ANTI-BLOCAGE : Si Android ne donne aucune rÃ©ponse au bout de 2 sec, on dÃ©bloque le flag
+        watchdogJob?.cancel()
+        watchdogJob = serviceScope.launch {
+            delay(2000)
+            if (isAnalyzing) {
+                Log.w("FilterService", "Watchdog : capture sans rÃ©ponse du systÃ¨me, dÃ©blocage forcÃ©.")
+                isAnalyzing = false
+            }
+        }
+
+        val wasOverlayShowing = isOverlayShowing
+        if (isOverlayShowing) {
+            overlayView?.alpha = 0f
+        }
+
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            screenshotExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(screenshotResult: ScreenshotResult) {
+                    watchdogJob?.cancel()
+                    consecutiveFailures = 0
+                    val hardwareBuffer = screenshotResult.hardwareBuffer
+                    val colorSpace = screenshotResult.colorSpace
+
+                    val fullBitmap = try {
+                        Bitmap.wrapHardwareBuffer(hardwareBuffer, colorSpace)
+                    } catch (e: Exception) {
+                        null
+                    }
+
+                    if (wasOverlayShowing) {
+                        serviceScope.launch(Dispatchers.Main) {
+                            overlayView?.alpha = 1f
+                        }
+                    }
+
+                    if (fullBitmap == null) {
+                        hardwareBuffer.close()
+                        isAnalyzing = false
+                        return
+                    }
+
+                    val softwareBitmap = try {
+                        fullBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                    } catch (e: Exception) {
+                        null
+                    }
+
+                    fullBitmap.recycle()
+                    hardwareBuffer.close()
+
+                    if (softwareBitmap == null) {
+                        isAnalyzing = false
+                        return
+                    }
+
+                    serviceScope.launch {
+                        try {
+                            var isNsfwDetected = false
+
+                            for (rect in imageBounds) {
+                                val croppedBitmap = cropBitmap(softwareBitmap, rect) ?: continue
+                                val cropScore = classifier.processAndClassify(croppedBitmap)
+                                croppedBitmap.recycle()
+
+                                if (cropScore > 0.45f) {
+                                    isNsfwDetected = true
+                                    Log.w("FilterService", "--> NSFW dÃ©tectÃ© zone $rect (Score: $cropScore)")
+                                    break
+                                }
+                            }
+
+                            if (!isNsfwDetected) {
+                                val globalScore = classifier.processAndClassify(softwareBitmap)
+                                if (globalScore > 0.55f) {
+                                    isNsfwDetected = true
+                                    Log.w("FilterService", "--> NSFW global dÃ©tectÃ© (Score: $globalScore)")
+                                }
+                            }
+
+                            val currentTime = System.currentTimeMillis()
+                            withContext(Dispatchers.Main) {
+                                if (isNsfwDetected) {
+                                    lastNsfwDetectedTime = currentTime
+                                    val blurredBitmap = createSafeLightBlurBitmap(softwareBitmap)
+                                    showOverlay(blurredBitmap)
+                                } else {
+                                    if (currentTime - lastNsfwDetectedTime > HOLD_MASK_MS) {
+                                        hideOverlay()
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e("FilterService", "Erreur analyse : ${e.message}", e)
+                        } finally {
+                            softwareBitmap.recycle()
+                            isAnalyzing = false
+                        }
+                    }
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    watchdogJob?.cancel()
+                    if (wasOverlayShowing) {
+                        serviceScope.launch(Dispatchers.Main) {
+                            overlayView?.alpha = 1f
+                        }
+                    }
+
+                    consecutiveFailures++
+                    Log.e("FilterService", "Ã‰chec capture (Code: $errorCode, ConsÃ©cutifs: $consecutiveFailures)")
+
+                    if (consecutiveFailures >= 3) {
+                        isCircuitBreakerActive = true
+                        serviceScope.launch {
+                            delay(4000)
+                            consecutiveFailures = 0
+                            isCircuitBreakerActive = false
+                            isAnalyzing = false
+                        }
+                    } else {
+                        serviceScope.launch {
+                            delay(400)
+                            isAnalyzing = false
+                        }
+                    }
+                }
+            }
+        )
+    }
+
+    private fun createSafeLightBlurBitmap(source: Bitmap): Bitmap {
+        var tinyBitmap: Bitmap? = null
+        var midBitmap: Bitmap? = null
+        try {
+            val lowWidth = (source.width * 0.05f).toInt().coerceAtLeast(1)
+            val lowHeight = (source.height * 0.05f).toInt().coerceAtLeast(1)
+            tinyBitmap = Bitmap.createScaledBitmap(source, lowWidth, lowHeight, true)
+
+            val midWidth = (source.width * 0.15f).toInt().coerceAtLeast(1)
+            val midHeight = (source.height * 0.15f).toInt().coerceAtLeast(1)
+            midBitmap = Bitmap.createScaledBitmap(tinyBitmap, midWidth, midHeight, true)
+
+            val blurredBitmap = Bitmap.createScaledBitmap(midBitmap, source.width, source.height, true)
+
+            val canvas = Canvas(blurredBitmap)
+            val lightPaint = Paint().apply {
+                color = 0x55FFFFFF.toInt()
+                style = Paint.Style.FILL
+            }
+            canvas.drawRect(0f, 0f, blurredBitmap.width.toFloat(), blurredBitmap.height.toFloat(), lightPaint)
+
+            return blurredBitmap
+        } finally {
+            tinyBitmap?.recycle()
+            midBitmap?.recycle()
+        }
+    }
+
+    private fun getVisibleImageBounds(): List<Rect> {
+        val root = rootInActiveWindow ?: return emptyList()
+        val boundsList = mutableListOf<Rect>()
+        try {
+            findImageNodesRecursive(root, boundsList)
+        } catch (e: Exception) {
+            Log.e("FilterService", "Erreur lecture nÅ“uds : ${e.message}")
+        } finally {
+            root.recycle()
+        }
+
+        return boundsList
+            .sortedByDescending { it.width() * it.height() }
+            .take(6)
+    }
+
+    private fun findImageNodesRecursive(node: AccessibilityNodeInfo?, boundsList: MutableList<Rect>) {
+        if (node == null) return
+
+        val className = node.className?.toString() ?: ""
+        val resourceId = node.viewIdResourceName?.lowercase() ?: ""
+
+        val isImageOrMediaView = className.contains("Image", ignoreCase = true) ||
+                className.contains("Graphic", ignoreCase = true) ||
+                className.contains("View", ignoreCase = true) && (resourceId.contains("photo") || resourceId.contains("image") || resourceId.contains("media") || resourceId.contains("picture"))
+
+        if (isImageOrMediaView) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+
+            if (rect.width() > 80 && rect.height() > 80) {
+                boundsList.add(rect)
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i)
+            if (child != null) {
+                findImageNodesRecursive(child, boundsList)
+                child.recycle()
+            }
+        }
+    }
+
+    private fun cropBitmap(source: Bitmap, rect: Rect): Bitmap? {
+        val x = rect.left.coerceIn(0, source.width - 1)
+        val y = rect.top.coerceIn(0, source.height - 1)
+        val width = rect.width().coerceAtMost(source.width - x)
+        val height = rect.height().coerceAtMost(source.height - y)
+
+        if (width <= 15 || height <= 15) return null
+        return try {
+            Bitmap.createBitmap(source, x, y, width, height)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun showOverlay(blurredBitmap: Bitmap) {
+        isOverlayShowing = true
+
+        val oldDrawable = overlayView?.drawable as? BitmapDrawable
+        overlayView?.setImageBitmap(blurredBitmap)
+        oldDrawable?.bitmap?.recycle()
+
+        overlayView?.alpha = 1f
+    }
+
+    private fun hideOverlay() {
+        isOverlayShowing = false
+        overlayView?.alpha = 0f
+
+        val oldDrawable = overlayView?.drawable as? BitmapDrawable
+        oldDrawable?.bitmap?.recycle()
+        overlayView?.setImageBitmap(null)
+    }
+
+    override fun onInterrupt() {}
+
+    override fun onDestroy() {
+        super.onDestroy()
+        watchdogJob?.cancel()
+        serviceScope.cancel()
+        screenshotExecutor.shutdown()
+        if (isOverlayAttached && overlayView != null) {
+            try {
+                windowManager?.removeView(overlayView)
+            } catch (e: Exception) {
+                Log.e("FilterService", "Erreur retrait overlay : ${e.message}")
+            }
+        }
+        classifier.close()
+    }
+}
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\java\com\example\nsfwfilter\MainActivity.kt
+==========================================
+package com.example.nsfwfilter
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        // Demande d'exemption d'optimisation de batterie (Anti-Mise en veille profonde Samsung)
+        requestBatteryOptimizationExemption()
+    }
+
+    private fun requestBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Veuillez dÃ©sactiver l'optimisation de la batterie pour NSFWFilter", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+}
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\java\com\example\nsfwfilter\NSFWClassifier.kt
+==========================================
+package com.example.nsfwfilter
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.util.Log
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.support.common.ops.NormalizeOp
+import org.tensorflow.lite.support.image.ImageProcessor
+import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.support.image.ops.ResizeOp
+import java.io.FileInputStream
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
+
+class NSFWClassifier(private val context: Context) {
+
+    private var interpreter: Interpreter? = null
+    private var inferenceCount = 0
+
+    init {
+        initInterpreter()
+    }
+
+    private fun initInterpreter() {
+        try {
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+            }
+            val model = loadModelFile(context, "nsfw_model.tflite")
+            interpreter = Interpreter(model, options)
+        } catch (e: Exception) {
+            Log.e("NSFWClassifier", "Erreur initialisation TFLite : ${e.message}")
+        }
+    }
+
+    private fun loadModelFile(context: Context, fileName: String): MappedByteBuffer {
+        val fileDescriptor = context.assets.openFd(fileName)
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        return fileChannel.map(
+            FileChannel.MapMode.READ_ONLY,
+            fileDescriptor.startOffset,
+            fileDescriptor.declaredLength
+        )
+    }
+
+    @Synchronized
+    fun processAndClassify(bitmap: Bitmap): Float {
+        inferenceCount++
+        if (inferenceCount >= 300) {
+            recycleNativeMemory()
+            inferenceCount = 0
+        }
+
+        val currentInterpreter = interpreter ?: return 0.0f
+
+        if (!hasSkinTone(bitmap)) {
+            return 0.0f
+        }
+
+        return try {
+            val imageProcessor = ImageProcessor.Builder()
+                .add(ResizeOp(224, 224, ResizeOp.ResizeMethod.BILINEAR))
+                .add(NormalizeOp(0.0f, 255.0f))
+                .build()
+
+            var tensorImage = TensorImage(currentInterpreter.getInputTensor(0).dataType())
+            tensorImage.load(bitmap)
+            tensorImage = imageProcessor.process(tensorImage)
+
+            val outputTensorShape = currentInterpreter.getOutputTensor(0).shape()
+            val numClasses = outputTensorShape[1]
+            val output = Array(1) { FloatArray(numClasses) }
+            currentInterpreter.run(tensorImage.buffer, output)
+
+            if (numClasses == 5) {
+                val hentai = output[0][1]
+                val porn = output[0][3]
+                val sexy = output[0][4]
+
+                // PrioritÃ© stricte sur porn/hentai et rÃ©duction du poids de 'sexy' Ã  0.20
+                val score = porn + hentai + (sexy * 0.20f)
+                score.coerceIn(0.0f, 1.0f)
+            } else {
+                output[0][0]
+            }
+        } catch (e: Exception) {
+            Log.e("NSFWClassifier", "Erreur infÃ©rence : ${e.message}")
+            0.0f
+        }
+    }
+
+    private fun hasSkinTone(bitmap: Bitmap): Boolean {
+        val small = Bitmap.createScaledBitmap(bitmap, 40, 40, false)
+        var skinCount = 0
+        val total = 40 * 40
+
+        for (y in 0 until 40) {
+            for (x in 0 until 40) {
+                val p = small.getPixel(x, y)
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+
+                // TolÃ©rance Ã©largie pour capter les gros plans, fortes lumiÃ¨res et ombres
+                val isSkin = (r > 40 && g > 20 && b > 10) &&
+                        (r >= g) &&
+                        (maxOf(r, g, b) - minOf(r, g, b) > 5)
+
+                if (isSkin) {
+                    skinCount++
+                }
+            }
+        }
+        small.recycle()
+        // Seuil abaissÃ© Ã  3% pour inclure les gros plans sans rejeter d'emblÃ©e
+        return (skinCount.toFloat() / total) > 0.03f
+    }
+
+    private fun recycleNativeMemory() {
+        try {
+            interpreter?.close()
+            interpreter = null
+            initInterpreter()
+            Log.d("NSFWClassifier", "--> MÃ©moire C++ TFLite purgÃ©e et rÃ©initialisÃ©e avec succÃ¨s.")
+        } catch (e: Exception) {
+            Log.e("NSFWClassifier", "Erreur purge mÃ©moire C++ : ${e.message}")
+        }
+    }
+
+    fun close() {
+        try {
+            interpreter?.close()
+            interpreter = null
+        } catch (e: Exception) {
+            Log.e("NSFWClassifier", "Erreur fermeture classifier : ${e.message}")
+        }
+    }
+}
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\drawable\ic_launcher_background.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#3DDC84"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M9,0L9,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,0L19,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,0L29,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,0L39,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,0L49,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,0L59,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,0L69,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,0L79,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M89,0L89,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M99,0L99,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,9L108,9"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,19L108,19"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,29L108,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,39L108,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,49L108,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,59L108,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,69L108,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,79L108,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,89L108,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,99L108,99"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,29L89,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,39L89,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,49L89,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,59L89,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,69L89,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,79L89,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,19L29,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,19L39,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,19L49,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,19L59,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,19L69,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,19L79,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+</vector>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\drawable\ic_launcher_foreground.xml
+==========================================
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:pathData="M31,63.928c0,0 6.4,-11 12.1,-13.1c7.2,-2.6 26,-1.4 26,-1.4l38.1,38.1L107,108.928l-32,-1L31,63.928z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="85.84757"
+                android:endY="92.4963"
+                android:startX="42.9492"
+                android:startY="49.59793"
+                android:type="linear">
+                <item
+                    android:color="#44000000"
+                    android:offset="0.0" />
+                <item
+                    android:color="#00000000"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="nonZero"
+        android:pathData="M65.3,45.828l3.8,-6.6c0.2,-0.4 0.1,-0.9 -0.3,-1.1c-0.4,-0.2 -0.9,-0.1 -1.1,0.3l-3.9,6.7c-6.3,-2.8 -13.4,-2.8 -19.7,0l-3.9,-6.7c-0.2,-0.4 -0.7,-0.5 -1.1,-0.3C38.8,38.328 38.7,38.828 38.9,39.228l3.8,6.6C36.2,49.428 31.7,56.028 31,63.928h46C76.3,56.028 71.8,49.428 65.3,45.828zM43.4,57.328c-0.8,0 -1.5,-0.5 -1.8,-1.2c-0.3,-0.7 -0.1,-1.5 0.4,-2.1c0.5,-0.5 1.4,-0.7 2.1,-0.4c0.7,0.3 1.2,1 1.2,1.8C45.3,56.528 44.5,57.328 43.4,57.328L43.4,57.328zM64.6,57.328c-0.8,0 -1.5,-0.5 -1.8,-1.2s-0.1,-1.5 0.4,-2.1c0.5,-0.5 1.4,-0.7 2.1,-0.4c0.7,0.3 1.2,1 1.2,1.8C66.5,56.528 65.6,57.328 64.6,57.328L64.6,57.328z"
+        android:strokeWidth="1"
+        android:strokeColor="#00000000" />
+</vector>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\layout\activity_main.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/main"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".MainActivity">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Hello World!"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\mipmap-anydpi\ic_launcher.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\mipmap-anydpi\ic_launcher_round.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\values\colors.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\values\strings.xml
+==========================================
+<resources>
+    <string name="app_name">NSFWFilter</string>
+</resources>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\values\themes.xml
+==========================================
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Base.Theme.NSFWFilter" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Customize your light theme here. -->
+        <!-- <item name="colorPrimary">@color/my_light_primary</item> -->
+    </style>
+
+    <style name="Theme.NSFWFilter" parent="Base.Theme.NSFWFilter" />
+</resources>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\values-night\themes.xml
+==========================================
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Base.Theme.NSFWFilter" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Customize your dark theme here. -->
+        <!-- <item name="colorPrimary">@color/my_dark_primary</item> -->
+    </style>
+</resources>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\xml\accessibility_config.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewScrolled|typeWindowContentChanged|typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:notificationTimeout="150" />
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\xml\backup_rules.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?><!--
+   Sample backup rules file; uncomment and customize as necessary.
+   See https://developer.android.com/guide/topics/data/autobackup
+   for details.
+   Note: This file is ignored for devices older than API 31
+   See https://developer.android.com/about/versions/12/backup-restore
+-->
+<full-backup-content>
+    <!--
+   <include domain="sharedpref" path="."/>
+   <exclude domain="sharedpref" path="device.xml"/>
+-->
+</full-backup-content>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\res\xml\data_extraction_rules.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?><!--
+   Sample data extraction rules file; uncomment and customize as necessary.
+   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
+   for details.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- TODO: Use <include> and <exclude> to control what is backed up.
+        <include .../>
+        <exclude .../>
+        -->
+    </cloud-backup>
+    <!--
+    <device-transfer>
+        <include .../>
+        <exclude .../>
+    </device-transfer>
+    -->
+</data-extraction-rules>
+
+
+==========================================
+FILE: C:\Users\Thomas FROUX\AndroidStudioProjects\NSFWFilter\app\src\main\AndroidManifest.xml
+==========================================
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Permissions pour empÃªcher le gel systÃ¨me en arriÃ¨re-plan -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NSFWFilter">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".FilterService"
+            android:exported="true"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Protection en temps rÃ©el du contenu d'Ã©cran" />
+        </service>
+
+    </application>
+
+</manifest>
+
+
