@@ -58,11 +58,15 @@ private const val STATIC_RECHECK_INTERVAL_MS = 1200L   // Intervalle de ré-anal
 * SDK Android 34 (Android 14) ou supérieur
 ### Étapes de Build
 1. Cloner le dépôt :
-```git clone [https://github.com/votre-utilisateur/NSFWFilter.git](https://github.com/votre-utilisateur/NSFWFilter.git)```
-2. Ouvrir le projet dans Android Studio.
-3. Synchroniser Gradle (Sync Project with Gradle Files).
-4. Compiler et installer sur un appareil Android sous Android 11 ou supérieur :
-```./gradlew installDebug```
+```text
+git clone [https://github.com/votre-utilisateur/NSFWFilter.git](https://github.com/votre-utilisateur/NSFWFilter.git)
+```
+3. Ouvrir le projet dans Android Studio.
+4. Synchroniser Gradle (Sync Project with Gradle Files).
+5. Compiler et installer sur un appareil Android sous Android 11 ou supérieur :
+```text
+./gradlew installDebug
+```
 
 ---
 
