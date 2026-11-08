@@ -40,13 +40,19 @@ LangageKotlinAPI MinimaleAndroid 11 (API level 30)Modèle IAMobileNetV2 NSFW Qua
 
 ## **⚙️ Configuration & Ajustement de la Sensibilité**
 
-Les seuils de sensibilité peuvent être ajustés directement dans NSFWClassifier.kt :Kotlin// Dans NSFWClassifier.kt
+Les seuils de sensibilité peuvent être ajustés directement dans NSFWClassifier.kt :
+```text
+// Dans NSFWClassifier.kt
 private const val CROP_THRESHOLD = 0.35f               // Seuil pour les nœuds d'images ciblés
 private const val GLOBAL_THRESHOLD = 0.35f             // Seuil pour l'écran complet
 private const val STRICT_NO_SKIN_THRESHOLD = 0.55f     // Seuil renforcé sans teinte chair (banques)
-Et la fréquence d'analyse dans FilterService.kt :Kotlin// Dans FilterService.kt
+```
+Et la fréquence d'analyse dans FilterService.kt :
+```text
+// Dans FilterService.kt
 private const val NORMAL_CAPTURE_INTERVAL_MS = 350L     // Intervalle pendant le défilement
 private const val STATIC_RECHECK_INTERVAL_MS = 1200L   // Intervalle de ré-analyse sur écran fixe
+```
 
 ---
 
@@ -59,7 +65,7 @@ private const val STATIC_RECHECK_INTERVAL_MS = 1200L   // Intervalle de ré-anal
 ### Étapes de Build
 1. Cloner le dépôt :
 ```text
-git clone https://github.com/votre-utilisateur/NSFWFilter.git
+git clone https://github.com/tfrx37/NSFWFilter1.git
 ```
 3. Ouvrir le projet dans Android Studio.
 4. Synchroniser Gradle (Sync Project with Gradle Files).
