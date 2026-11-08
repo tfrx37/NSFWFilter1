@@ -59,7 +59,7 @@ private const val STATIC_RECHECK_INTERVAL_MS = 1200L   // Intervalle de ré-anal
 ### Étapes de Build
 1. Cloner le dépôt :
 ```text
-git clone [https://github.com/votre-utilisateur/NSFWFilter.git](https://github.com/votre-utilisateur/NSFWFilter.git)
+git clone https://github.com/votre-utilisateur/NSFWFilter.git
 ```
 3. Ouvrir le projet dans Android Studio.
 4. Synchroniser Gradle (Sync Project with Gradle Files).
