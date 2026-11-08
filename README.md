@@ -33,8 +33,13 @@ com.example.nsfwfilter/
 
 ## **🛠️ Spécifications Techniques**
 
-ComposantTechnologie / Modèle
-LangageKotlinAPI MinimaleAndroid 11 (API level 30)Modèle IAMobileNetV2 NSFW Quantized (nsfw_model.tflite)PrétraitementNormalisation Keras [-1.0, 1.0], Resize Bilinéaire 224x224ConcurrenceCoroutines Kotlin (SupervisorJob, Dispatchers.Default), AtomicLong
+| Composant | Technologie / Modèle |
+| :--- | :--- |
+| **Langage** | Kotlin |
+| **API Minimale** | Android 11 (API level 30) |
+| **Modèle IA** | MobileNetV2 NSFW Quantized (`nsfw_model.tflite`) |
+| **Prétraitement** | Normalisation Keras `[-1.0, 1.0]`, Resize Bilinéaire `224x224` |
+| **Concurrence** | Coroutines Kotlin (`SupervisorJob`, `Dispatchers.Default`), `AtomicLong` |
 
 ---
 
